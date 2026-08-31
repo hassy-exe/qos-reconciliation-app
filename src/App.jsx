@@ -83,7 +83,15 @@ function Workspace({ qosFile, opFile, setQosFile, setOpFile, running, onRun, onS
   return <div className="workspace-wrap">
     <div className="heading"><h1>QOS Reconciliation</h1><p>Upload QOS DATA and the operator/Mixx ledger. Matching happens completely in your browser.</p></div>
     <div className="drop-grid"><Dropzone title="QOS DATA Workbook" subtitle="System of record · .xlsx, .xls or .csv" file={qosFile} onFile={setQosFile}/><Dropzone title="Operator / Mixx Workbook" subtitle="Partner-submitted ledger · .xlsx, .xls or .csv" file={opFile} onFile={setOpFile}/></div>
-    <div className="run-row"><Button onClick={onRun} disabled={!qosFile||!opFile||running}>{running?<><Loader2 className="spin" size={16}/> Reconciling...</>:<><FileCheck2 size={16}/> Run Reconciliation</>}</Button><Button secondary onClick={onSample} disabled={running}>Load July 2026 Sample Files</Button></div>
+   <div className="run-row">
+  <Button onClick={onRun} disabled={!qosFile || !opFile || running}>
+    {running ? (
+      <><Loader2 className="spin" size={16} /> Reconciling...</>
+    ) : (
+      <><FileCheck2 size={16} /> Run Reconciliation</>
+    )}
+  </Button>
+</div>
     {error && <div className="error-box"><AlertTriangle size={17}/>{error}</div>}
     <div className="logic card"><b>Matching logic used</b><p>Primary keys: <code>QOS.momtransactionId ↔ MIXX.trans_id</code> and fallback <code>QOS.clientid + "!" + QOS.transRef ↔ MIXX.idRequete</code>.</p><p>Amount check: <code>MAKEDEPOSIT → QOS.netAmount</code>; other QOS transaction types → <code>QOS.amount</code>.</p></div>
   </div>
