@@ -105,7 +105,46 @@ function Discrepancies({ result }) { if(!result)return <Empty/>; const rows=resu
 
 export default function App(){
   const [page,setPage]=useState("dashboard"), [qosFile,setQosFile]=useState(null), [opFile,setOpFile]=useState(null), [result,setResult]=useState(null), [running,setRunning]=useState(false), [error,setError]=useState("");
-  const run=async(q=qosFile,o=opFile)=>{ try{setRunning(true);setError(""); const [qos,op]=await Promise.all([readWorkbook(q),readWorkbook(o)]); if(!qos.length||!op.length) throw new Error("One of the workbooks has no data rows."); const r=reconcile(qos,op); setResult(r); setPage("dashboard"); }catch(e){console.error(e);setError(e?.message||"Could not read or reconcile the files.");setPage("workspace");}finally{setRunning(false)} };
+  // UPDATED CODE (WITH FASTAPI CONNECTION)
+const run = async (q = qosFile, o = opFile) => {
+  try {
+    setRunning(true);
+    setError("");
+
+    // 1. Send files to FastAPI Python Backend
+    const formData = new FormData();
+    formData.append("system_file", q);
+    formData.append("gateway_file", o);
+
+    const response = await fetch("http://127.0.0.1:8000/api/reconcile", {
+      method: "POST",
+      body: formData,
+    });
+
+    if (!response.ok) {
+      const errorData = await response.json();
+      throw new Error(errorData.detail || "API Reconciliation failed.");
+    }
+
+    const apiResults = await response.json();
+    console.log("FastAPI Engine Output:", apiResults);
+
+    // 2. Process workbook data locally for dashboard rendering
+    const [qos, op] = await Promise.all([readWorkbook(q), readWorkbook(o)]);
+    if (!qos.length || !op.length) throw new Error("One of the workbooks has no data rows.");
+    
+    const r = reconcile(qos, op);
+    setResult(r);
+    setPage("dashboard");
+
+  } catch (e) {
+    console.error(e);
+    setError(e?.message || "Could not read or reconcile the files.");
+    setPage("workspace");
+  } finally {
+    setRunning(false);
+  }
+};
   const sample=async()=>{try{setRunning(true);setError(""); const [qa,oa]=await Promise.all([fetch('/samples/QOS DATA JULY 2026.xlsx'),fetch('/samples/MIXX BY YAS DATA JULY 2026.xlsx')]); const [qb,ob]=await Promise.all([qa.arrayBuffer(),oa.arrayBuffer()]); setQosFile(new File([qb],"QOS DATA JULY 2026.xlsx")); setOpFile(new File([ob],"MIXX BY YAS DATA JULY 2026.xlsx")); const [qos,op]=await Promise.all([readWorkbook(qb),readWorkbook(ob)]); setResult(reconcile(qos,op)); setPage("dashboard");}catch(e){setError(e?.message||"Could not load bundled sample files.");setPage("workspace");}finally{setRunning(false)}};
   const title=NAV.find(n=>n[0]===page)?.[1]||"Dashboard";
   return <div className="app"><Sidebar active={page} onNavigate={setPage} hasResults={!!result}/><section className="shell"><Topbar title={title} result={result}/><main>{page==="dashboard"?<Dashboard result={result} onNavigate={setPage}/>:page==="workspace"?<Workspace {...{qosFile,opFile,setQosFile,setOpFile,running}} onRun={()=>run()} onSample={sample} error={error}/>:page==="reports"?<Reports result={result}/>:<Discrepancies result={result}/>}</main></section></div>
