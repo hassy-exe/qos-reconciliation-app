@@ -124,7 +124,7 @@ const run = async (q = qosFile, o = opFile) => {
     formData.append("system_file", q);
     formData.append("gateway_file", o);
 
-    const response = await fetch("http://127.0.0.1:8000/api/reconcile", {
+    const response = await fetch("https://qos-recon-backend.onrender.com/api/reconcile", {
       method: "POST",
       body: formData,
     });
