@@ -371,3 +371,45 @@ async def reconcile_qos_vs_mixx(
     except Exception as e:
         logger.exception("QoS vs Mixx reconciliation failed")
         raise HTTPException(status_code=400, detail=f"Reconciliation failed: {str(e)}")
+
+    # ---------------------------------------------------------------------------
+# PASTE THIS AT THE VERY BOTTOM OF backend/main.py (then save the file).
+# It needs no new imports: everything it uses is already defined in main.py.
+# ---------------------------------------------------------------------------
+
+@app.get("/api/qos/transactions")
+def get_qos_transactions(date_from: str, date_to: str):
+    """
+    Returns the QOS transactions between two datetimes (e.g. 2026-09-10 00:00:00).
+    The column names are renamed to match the QOS workbook columns that
+    src/reconcile.js already expects (momtransactionId, transRef, operationType, netAmount).
+    ASSUMPTION: clientrefno in the table is the same value as "transRef" in the QOS workbook.
+    """
+    sql = """
+        SELECT
+            momtransaction_id AS momtransactionId,
+            clientid,
+            clientrefno AS transRef,
+            operation_type AS operationType,
+            amount,
+            net_amount AS netAmount,
+            trxndate,
+            currency,
+            response,
+            responsemessage
+        FROM transactions_tg
+        WHERE trxndate >= %s AND trxndate <= %s
+        ORDER BY trxndate
+    """
+    connection = None
+    try:
+        connection = get_db_connection()
+        with connection.cursor() as cursor:
+            cursor.execute(sql, (date_from, date_to))
+            return cursor.fetchall()
+    except Exception:
+        logger.exception("Could not load QOS transactions")
+        raise HTTPException(status_code=500, detail="Could not load QOS transactions from the database")
+    finally:
+        if connection:
+            connection.close()

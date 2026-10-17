@@ -7,7 +7,10 @@ import {
 import {
   Bar, BarChart, CartesianGrid, ResponsiveContainer, Tooltip, XAxis, YAxis
 } from "recharts";
-import { exportResults, formatDate, money, readWorkbook, reconcile } from "./reconcile.js";
+import { exportResults, formatDate, money, readWorkbook, reconcile, excelDate } from "./reconcile.js";
+
+// Backend address. Set VITE_API_URL in a file called .env.local to test against a local backend.
+const API_URL = import.meta.env.VITE_API_URL || "https://qos-recon-backend.onrender.com";
 
 const NAV = [
   ["dashboard", "Dashboard", LayoutDashboard],
@@ -15,6 +18,32 @@ const NAV = [
   ["reports", "Operator Reports", FileSpreadsheet],
   ["discrepancies", "Discrepancy Logs", AlertTriangle],
 ];
+
+// ---- QOS data now comes from the database, for the dates found in the Mixx file ----
+const pad = (n) => String(n).padStart(2, "0");
+const dayStart = (d) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} 00:00:00`;
+const dayEnd = (d) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} 23:59:59`;
+
+async function fetchQosRows(operatorRows) {
+  const dates = operatorRows.map((r) => excelDate(r.trans_date)).filter(Boolean);
+  if (!dates.length) throw new Error("Could not read any dates (trans_date column) from the Mixx file.");
+
+  let first = dates[0];
+  let last = dates[0];
+  for (const d of dates) {
+    if (d < first) first = d;
+    if (d > last) last = d;
+  }
+
+  const params = new URLSearchParams({ date_from: dayStart(first), date_to: dayEnd(last) });
+  const res = await fetch(`${API_URL}/api/qos/transactions?${params}`);
+  if (!res.ok) {
+    let detail = "";
+    try { detail = (await res.json()).detail; } catch { /* ignore */ }
+    throw new Error(detail || "Could not load QOS transactions from the server.");
+  }
+  return res.json();
+}
 
 function Badge({ status }) {
   const Icon = status === "Matched" ? CheckCircle2 : status === "Mismatched" ? AlertTriangle : XCircle;
@@ -77,22 +106,23 @@ function Dashboard({ result, onNavigate }) {
   </>
 }
 
-function Empty({ onGo }) { return <div className="empty"><div className="round-icon large"><FileSpreadsheet size={28}/></div><h2>No reconciliation loaded</h2><p>Open Workspace, upload the QOS and operator files, then run the audit.</p><Button onClick={onGo}><UploadCloud size={16}/> Open Workspace</Button></div> }
+function Empty({ onGo }) { return <div className="empty"><div className="round-icon large"><FileSpreadsheet size={28}/></div><h2>No reconciliation loaded</h2><p>Open Workspace, upload the Mixx file, then run the audit.</p><Button onClick={onGo}><UploadCloud size={16}/> Open Workspace</Button></div> }
 
-function Workspace({ qosFile, opFile, setQosFile, setOpFile, running, onRun, onSample, error }) {
+function Workspace({ opFile, setOpFile, running, onRun, error }) {
   return <div className="workspace-wrap">
-    <div className="heading"><h1>QOS Reconciliation</h1><p>Upload QOS DATA and the operator/Mixx ledger. Matching happens completely in your browser.</p></div>
-    <div className="drop-grid"><Dropzone title="QOS DATA Workbook" subtitle="System of record · .xlsx, .xls or .csv" file={qosFile} onFile={setQosFile}/><Dropzone title="Operator / Mixx Workbook" subtitle="Partner-submitted ledger · .xlsx, .xls or .csv" file={opFile} onFile={setOpFile}/></div>
-   <div className="run-row">
-  <Button onClick={onRun} disabled={!qosFile || !opFile || running}>
-    {running ? (
-      <><Loader2 className="spin" size={16} /> Reconciling...</>
-    ) : (
-      <><FileCheck2 size={16} /> Run Reconciliation</>
-    )}
-  </Button>
-</div>
+    <div className="heading"><h1>QOS Reconciliation</h1><p>Upload the operator/Mixx ledger. QOS transactions are loaded automatically for the same dates, and matching happens in your browser.</p></div>
+    <div className="drop-grid" style={{ gridTemplateColumns: "minmax(0, 560px)" }}><Dropzone title="Operator / Mixx Workbook" subtitle="Partner-submitted ledger · .xlsx, .xls or .csv" file={opFile} onFile={setOpFile}/></div>
+    <div className="run-row">
+      <Button onClick={onRun} disabled={!opFile || running}>
+        {running ? (
+          <><Loader2 className="spin" size={16} /> Reconciling...</>
+        ) : (
+          <><FileCheck2 size={16} /> Run Reconciliation</>
+        )}
+      </Button>
+    </div>
     {error && <div className="error-box"><AlertTriangle size={17}/>{error}</div>}
+    <div className="logic card"><b>QOS data source</b><p>Loaded automatically from the QOS transactions database, for the date range found in the Mixx file.</p></div>
     <div className="logic card"><b>Matching logic used</b><p>Primary keys: <code>QOS.momtransactionId ↔ MIXX.trans_id</code> and fallback <code>QOS.clientid + "!" + QOS.transRef ↔ MIXX.idRequete</code>.</p><p>Amount check: <code>MAKEDEPOSIT → QOS.netAmount</code>; other QOS transaction types → <code>QOS.amount</code>.</p></div>
   </div>
 }
@@ -112,48 +142,33 @@ function Reports({ result }) { if(!result)return <Empty/>; return <><div classNa
 function Discrepancies({ result }) { if(!result)return <Empty/>; const rows=result.rows.filter(r=>r.status!=="Matched"); return <><div className="heading"><h1>Discrepancy Logs</h1><p>{rows.length.toLocaleString()} unmatched or mismatched records require review.</p></div><DataTable rows={rows}/></> }
 
 export default function App(){
-  const [page,setPage]=useState("dashboard"), [qosFile,setQosFile]=useState(null), [opFile,setOpFile]=useState(null), [result,setResult]=useState(null), [running,setRunning]=useState(false), [error,setError]=useState("");
-  // UPDATED CODE (WITH FASTAPI CONNECTION)
-const run = async (q = qosFile, o = opFile) => {
-  try {
-    setRunning(true);
-    setError("");
+  const [page,setPage]=useState("dashboard"), [opFile,setOpFile]=useState(null), [result,setResult]=useState(null), [running,setRunning]=useState(false), [error,setError]=useState("");
 
-    // 1. Send files to FastAPI Python Backend
-    const formData = new FormData();
-    formData.append("system_file", q);
-    formData.append("gateway_file", o);
+  const run = async (o = opFile) => {
+    try {
+      setRunning(true);
+      setError("");
 
-    const response = await fetch("https://qos-recon-backend.onrender.com/api/reconcile", {
-      method: "POST",
-      body: formData,
-    });
+      // 1. Read the Mixx file in the browser
+      const op = await readWorkbook(o);
+      if (!op.length) throw new Error("The Mixx workbook has no data rows.");
 
-    if (!response.ok) {
-      const errorData = await response.json();
-      throw new Error(errorData.detail || "API Reconciliation failed.");
+      // 2. Load the QOS transactions for the same dates from the backend database
+      const qos = await fetchQosRows(op);
+      if (!qos.length) throw new Error("No QOS transactions were found in the database for the dates in this Mixx file.");
+
+      // 3. Match them with the existing reconcile() logic
+      setResult(reconcile(qos, op));
+      setPage("dashboard");
+    } catch (e) {
+      console.error(e);
+      setError(e?.message || "Could not read or reconcile the file.");
+      setPage("workspace");
+    } finally {
+      setRunning(false);
     }
+  };
 
-    const apiResults = await response.json();
-    console.log("FastAPI Engine Output:", apiResults);
-
-    // 2. Process workbook data locally for dashboard rendering
-    const [qos, op] = await Promise.all([readWorkbook(q), readWorkbook(o)]);
-    if (!qos.length || !op.length) throw new Error("One of the workbooks has no data rows.");
-    
-    const r = reconcile(qos, op);
-    setResult(r);
-    setPage("dashboard");
-
-  } catch (e) {
-    console.error(e);
-    setError(e?.message || "Could not read or reconcile the files.");
-    setPage("workspace");
-  } finally {
-    setRunning(false);
-  }
-};
-  const sample=async()=>{try{setRunning(true);setError(""); const [qa,oa]=await Promise.all([fetch('/samples/QOS DATA JULY 2026.xlsx'),fetch('/samples/MIXX BY YAS DATA JULY 2026.xlsx')]); const [qb,ob]=await Promise.all([qa.arrayBuffer(),oa.arrayBuffer()]); setQosFile(new File([qb],"QOS DATA JULY 2026.xlsx")); setOpFile(new File([ob],"MIXX BY YAS DATA JULY 2026.xlsx")); const [qos,op]=await Promise.all([readWorkbook(qb),readWorkbook(ob)]); setResult(reconcile(qos,op)); setPage("dashboard");}catch(e){setError(e?.message||"Could not load bundled sample files.");setPage("workspace");}finally{setRunning(false)}};
   const title=NAV.find(n=>n[0]===page)?.[1]||"Dashboard";
-  return <div className="app"><Sidebar active={page} onNavigate={setPage} hasResults={!!result}/><section className="shell"><Topbar title={title} result={result}/><main>{page==="dashboard"?<Dashboard result={result} onNavigate={setPage}/>:page==="workspace"?<Workspace {...{qosFile,opFile,setQosFile,setOpFile,running}} onRun={()=>run()} onSample={sample} error={error}/>:page==="reports"?<Reports result={result}/>:<Discrepancies result={result}/>}</main></section></div>
+  return <div className="app"><Sidebar active={page} onNavigate={setPage} hasResults={!!result}/><section className="shell"><Topbar title={title} result={result}/><main>{page==="dashboard"?<Dashboard result={result} onNavigate={setPage}/>:page==="workspace"?<Workspace {...{opFile,setOpFile,running}} onRun={()=>run()} error={error}/>:page==="reports"?<Reports result={result}/>:<Discrepancies result={result}/>}</main></section></div>
 }
