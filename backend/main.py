@@ -1,12 +1,16 @@
 import io
+import json
 import os
 import secrets
 import logging
+from datetime import date, datetime
+from decimal import Decimal
 
 import pandas as pd
 import pymysql
 from fastapi import FastAPI, UploadFile, File, HTTPException, Header, Depends
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 logging.basicConfig(level=logging.INFO)
@@ -372,17 +376,25 @@ async def reconcile_qos_vs_mixx(
         logger.exception("QoS vs Mixx reconciliation failed")
         raise HTTPException(status_code=400, detail=f"Reconciliation failed: {str(e)}")
 
-    # ---------------------------------------------------------------------------
-# PASTE THIS AT THE VERY BOTTOM OF backend/main.py (then save the file).
-# It needs no new imports: everything it uses is already defined in main.py.
+
 # ---------------------------------------------------------------------------
+# QOS transactions for the web page (streamed, so the server never holds
+# all rows in memory at once -- the free Render server only has 512 MB)
+# ---------------------------------------------------------------------------
+def _json_default(value):
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    if isinstance(value, Decimal):
+        return float(value)
+    return str(value)
+
 
 @app.get("/api/qos/transactions")
 def get_qos_transactions(date_from: str, date_to: str):
     """
-    Returns the QOS transactions between two datetimes (e.g. 2026-09-10 00:00:00).
-    The column names are renamed to match the QOS workbook columns that
-    src/reconcile.js already expects (momtransactionId, transRef, operationType, netAmount).
+    Returns the QOS transactions between two datetimes (e.g. 2026-09-10 00:00:00),
+    streamed as a JSON list. Column names are renamed to match the QOS workbook
+    columns that src/reconcile.js expects (momtransactionId, transRef, operationType, netAmount).
     ASSUMPTION: clientrefno in the table is the same value as "transRef" in the QOS workbook.
     """
     sql = """
@@ -404,12 +416,26 @@ def get_qos_transactions(date_from: str, date_to: str):
     connection = None
     try:
         connection = get_db_connection()
-        with connection.cursor() as cursor:
-            cursor.execute(sql, (date_from, date_to))
-            return cursor.fetchall()
+        cursor = connection.cursor(pymysql.cursors.SSDictCursor)  # streams rows, does not load them all
+        cursor.execute(sql, (date_from, date_to))
     except Exception:
-        logger.exception("Could not load QOS transactions")
-        raise HTTPException(status_code=500, detail="Could not load QOS transactions from the database")
-    finally:
         if connection:
             connection.close()
+        logger.exception("Could not load QOS transactions")
+        raise HTTPException(status_code=500, detail="Could not load QOS transactions from the database")
+
+    def stream():
+        try:
+            yield "["
+            first = True
+            for row in cursor:
+                if not first:
+                    yield ","
+                first = False
+                yield json.dumps(row, default=_json_default)
+            yield "]"
+        finally:
+            cursor.close()
+            connection.close()
+
+    return StreamingResponse(stream(), media_type="application/json")
