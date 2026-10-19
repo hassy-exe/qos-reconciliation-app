@@ -4,3 +4,4 @@ pandas
 openpyxl
 python-multipart
 pymysql
+python-dotenv
