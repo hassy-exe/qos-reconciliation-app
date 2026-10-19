@@ -1,387 +1,135 @@
+
+import csv
+import hashlib
+import hmac
 import io
 import json
+import logging
 import os
 import secrets
-import logging
+import time
 from datetime import date, datetime
 from decimal import Decimal
+from pathlib import Path
+from typing import Optional
 
 import pandas as pd
 import pymysql
-from fastapi import FastAPI, UploadFile, File, HTTPException, Header, Depends
+from dotenv import load_dotenv
+from fastapi import Depends, FastAPI, File, Header, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.middleware.gzip import GZipMiddleware
+from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("qos")
+BASE_DIR = Path(__file__).resolve().parent
+load_dotenv(BASE_DIR / ".env")
+
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
+logger = logging.getLogger("qos-recon")
 
 app = FastAPI(title="QOS Reconciliation & Ingestion Engine")
+app.add_middleware(GZipMiddleware, minimum_size=1000)
 
-# Allow CORS for local dev and frontend apps
+origins = [
+    origin.strip()
+    for origin in os.getenv("ALLOWED_ORIGINS", "*").split(",")
+    if origin.strip()
+]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=origins or ["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ---------------------------------------------------------------------------
-# Config
-# ---------------------------------------------------------------------------
-# MySQL Database Configuration (XAMPP Default)
 DB_HOST = os.getenv("DB_HOST", "localhost")
-DB_USER = os.getenv("DB_USER", "root")
+DB_USER = os.getenv("DB_USER", "")
 DB_PASSWORD = os.getenv("DB_PASSWORD", "")
-DB_NAME = os.getenv("DB_NAME", "recon-svc")
+DB_NAME = os.getenv("DB_NAME", "")
 DB_PORT = int(os.getenv("DB_PORT", "3306"))
-
-# Shared secret the webhook sender must provide in the X-API-Key header
-API_KEY = os.getenv("QOS_API_KEY")
-
-# ---------------------------------------------------------------------------
-# QoS vs Mixx reconciliation settings -- ADJUST THESE to match your real files
-# ---------------------------------------------------------------------------
-# Column in transactions_tg that holds the ID Mixx also uses for the same transaction
-QOS_KEY_COLUMN = "momtransaction_id"
-# Column in transactions_tg to compare against the Mixx amount ("amount" or "net_amount")
-QOS_AMOUNT_COLUMN = "amount"
-# Possible header names in the Mixx file (after lowercasing and replacing spaces with _)
-MIXX_ID_CANDIDATES = ["transaction_id", "transactionid", "trxn_id", "reference", "txn_id", "id"]
-MIXX_AMOUNT_CANDIDATES = ["amount", "montant"]
-MIXX_STATUS_CANDIDATES = ["status", "statut", "state"]
-# Status values (lowercase) that count as a successful transaction on either side
-SUCCESS_STATUSES = {"completed", "success", "successful", "succeeded", "00", "ok"}
-# Amounts closer than this are treated as equal
-AMOUNT_TOLERANCE = 0.01
-
-
-def verify_api_key(x_api_key: str | None = Header(default=None)):
-    if not API_KEY:
-        logger.error("QOS_API_KEY is not set on the server")
-        raise HTTPException(status_code=500, detail="Server API key not configured")
-    if not x_api_key or not secrets.compare_digest(x_api_key, API_KEY):
-        raise HTTPException(status_code=401, detail="Invalid or missing API key")
+API_KEY = os.getenv("API_KEY", "")
+TEAM_PASSWORD = os.getenv("TEAM_PASSWORD", "")
+TOKEN_SECRET = os.getenv("TOKEN_SECRET", "change-this-token-secret")
+TOKEN_HOURS = int(os.getenv("TOKEN_HOURS", "12"))
 
 
 def get_db_connection():
+    if not DB_USER or not DB_NAME:
+        raise RuntimeError("DB_USER and DB_NAME must be set in backend/.env")
+
     return pymysql.connect(
         host=DB_HOST,
         user=DB_USER,
         password=DB_PASSWORD,
         database=DB_NAME,
         port=DB_PORT,
+        charset="utf8mb4",
         cursorclass=pymysql.cursors.DictCursor,
+        connect_timeout=15,
+        read_timeout=300,
+        write_timeout=300,
+        autocommit=True,
     )
 
 
-def clean_dataframe(df: pd.DataFrame) -> pd.DataFrame:
-    """Standardize column names and strip whitespace."""
-    df.columns = df.columns.astype(str).str.strip().str.lower().str.replace(" ", "_")
-    return df
+def _sign(value: str) -> str:
+    return hmac.new(
+        TOKEN_SECRET.encode(),
+        value.encode(),
+        hashlib.sha256,
+    ).hexdigest()
 
 
-# ---------------------------------------------------------------------------
-# Models
-# ---------------------------------------------------------------------------
-class QoSTransactionPayload(BaseModel):
-    sendersmsisdn: str | None = None
-    sendersfirstname: str | None = None
-    senderslastname: str | None = None
-    operation_type: str | None = None
-    receiversmsisdn: str | None = None
-    processingnumber: str | None = None
-    amount: float | None = None
-    trxndate: str | None = None
-    clientid: str | None = None
-    currency: str | None = None
-    response: str | None = None
-    responsemessage: str | None = None
-    fee: float | None = None
-    status: str | None = None
-    clientrefno: str | None = None
-    responsetime: str | None = None
-    narration: str | None = None
-    momtransaction_id: str | None = None
-    channel: str | None = None
-    transactionid: str | None = None
-    net_amount: float | None = None
-    country: str | None = None
-    intent_id: str | None = None
-    provider: str | None = None
-    token: str | None = None
-    sent_to_mifos: bool | None = None
-    reservation_state: str | None = None
+def _make_token(password: str) -> str:
+    expires = str(int(time.time()) + TOKEN_HOURS * 3600)
+    fingerprint = hashlib.sha256(password.encode()).hexdigest()[:16]
+    payload = f"{expires}:{fingerprint}"
+    return f"{payload}:{_sign(payload)}"
 
 
-# ---------------------------------------------------------------------------
-# Routes
-# ---------------------------------------------------------------------------
-@app.get("/")
-def health_check():
-    return {"status": "ok", "service": "QOS Reconciliation & Ingestion Engine"}
+def require_login(authorization: Optional[str] = Header(default=None)):
+    if not authorization or not authorization.lower().startswith("bearer "):
+        raise HTTPException(status_code=401, detail="Login required")
 
+    token = authorization.split(" ", 1)[1].strip()
 
-@app.post("/webhook/qos", dependencies=[Depends(verify_api_key)])
-async def receive_qos_webhook(payload: QoSTransactionPayload):
-    # A missing transactionid would bypass duplicate protection (NULLs are not
-    # treated as duplicates by a UNIQUE index), so reject it up front.
-    if not payload.transactionid:
-        raise HTTPException(status_code=422, detail="transactionid is required")
-
-    connection = None
     try:
-        connection = get_db_connection()
-        with connection.cursor() as cursor:
-            sql = """
-                INSERT INTO transactions_tg (
-                    sendersmsisdn, sendersfirstname, senderslastname, operation_type,
-                    receiversmsisdn, processingnumber, amount, trxndate, clientid,
-                    currency, response, responsemessage, fee, status, clientrefno,
-                    responsetime, narration, momtransaction_id, channel, transactionid,
-                    net_amount, country, intent_id, provider, token, sent_to_mifos, reservation_state
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                ON DUPLICATE KEY UPDATE
-                    status = VALUES(status),
-                    response = VALUES(response),
-                    responsemessage = VALUES(responsemessage)
-            """
-            cursor.execute(sql, (
-                payload.sendersmsisdn, payload.sendersfirstname, payload.senderslastname, payload.operation_type,
-                payload.receiversmsisdn, payload.processingnumber, payload.amount, payload.trxndate, payload.clientid,
-                payload.currency, payload.response, payload.responsemessage, payload.fee, payload.status, payload.clientrefno,
-                payload.responsetime, payload.narration, payload.momtransaction_id, payload.channel, payload.transactionid,
-                payload.net_amount, payload.country, payload.intent_id, payload.provider, payload.token,
-                1 if payload.sent_to_mifos else 0, payload.reservation_state,
-            ))
-            # MySQL affected-rows: 1 = new row inserted, 2 = existing row updated, 0 = existing row unchanged
-            created = cursor.rowcount == 1
-            connection.commit()
+        expires, fingerprint, signature = token.split(":", 2)
+        payload = f"{expires}:{fingerprint}"
 
-        return {
-            "status": "success",
-            "result": "created" if created else "already_ingested",
-            "transactionid": payload.transactionid,
-        }
+        if int(expires) < int(time.time()):
+            raise ValueError("Expired token")
+
+        if not hmac.compare_digest(signature, _sign(payload)):
+            raise ValueError("Invalid signature")
     except Exception:
-        if connection:
-            connection.rollback()
-        # Full details go to the server log, not back to the caller
-        logger.exception("Webhook ingestion failed for transactionid=%s", payload.transactionid)
-        # 500 so the sender knows it's our side and retries
-        raise HTTPException(status_code=500, detail="Webhook ingestion failed")
-    finally:
-        if connection:
-            connection.close()
+        raise HTTPException(status_code=401, detail="Invalid or expired session")
+
+    return True
 
 
-@app.post("/api/reconcile")
-async def reconcile_files(
-    system_file: UploadFile = File(...),
-    gateway_file: UploadFile = File(...),
-):
-    try:
-        sys_bytes = await system_file.read()
-        gtw_bytes = await gateway_file.read()
-
-        sys_df = pd.read_excel(io.BytesIO(sys_bytes)) if system_file.filename.endswith((".xlsx", ".xls")) else pd.read_csv(io.BytesIO(sys_bytes))
-        gtw_df = pd.read_excel(io.BytesIO(gtw_bytes)) if gateway_file.filename.endswith((".xlsx", ".xls")) else pd.read_csv(io.BytesIO(gtw_bytes))
-
-        sys_df = clean_dataframe(sys_df)
-        gtw_df = clean_dataframe(gtw_df)
-
-        sys_id_col = "transaction_id" if "transaction_id" in sys_df.columns else sys_df.columns[0]
-        gtw_id_col = "transaction_id" if "transaction_id" in gtw_df.columns else gtw_df.columns[0]
-
-        sys_df[sys_id_col] = sys_df[sys_id_col].astype(str).str.strip()
-        gtw_df[gtw_id_col] = gtw_df[gtw_id_col].astype(str).str.strip()
-
-        merged = pd.merge(
-            sys_df,
-            gtw_df,
-            left_on=sys_id_col,
-            right_on=gtw_id_col,
-            how="outer",
-            indicator=True,
-        )
-
-        total_records = len(merged)
-        matched_records = len(merged[merged["_merge"] == "both"])
-        missing_in_gateway = len(merged[merged["_merge"] == "left_only"])
-        missing_in_system = len(merged[merged["_merge"] == "right_only"])
-
-        audit_health = round((matched_records / total_records * 100), 2) if total_records > 0 else 0.0
-
-        return {
-            "summary": {
-                "audit_health": audit_health,
-                "total_records": total_records,
-                "matched_records": matched_records,
-                "missing_in_gateway": missing_in_gateway,
-                "missing_in_system": missing_in_system,
-            },
-            "mismatched_ids": merged[merged["_merge"] != "both"][sys_id_col].fillna(merged[gtw_id_col]).head(100).tolist(),
-        }
-
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Reconciliation failed: {str(e)}")
+class LoginPayload(BaseModel):
+    password: str
 
 
-# ---------------------------------------------------------------------------
-# QoS (live, from MySQL) vs Mixx (uploaded file) reconciliation
-# ---------------------------------------------------------------------------
-def pick_column(df: pd.DataFrame, candidates: list[str]) -> str | None:
-    for name in candidates:
-        if name in df.columns:
-            return name
-    return None
+class QoSTransactionPayload(BaseModel):
+    sendersmsisdn: Optional[str] = None
+    receiversmsisdn: Optional[str] = None
+    amount: Optional[float] = None
+    net_amount: Optional[float] = None
+    currency: Optional[str] = None
+    clientid: Optional[str] = None
+    clientrefno: Optional[str] = None
+    momtransaction_id: Optional[str] = None
+    operation_type: Optional[str] = None
+    trxndate: Optional[str] = None
+    response: Optional[str] = None
+    responsemessage: Optional[str] = None
 
 
-def to_number(series: pd.Series) -> pd.Series:
-    cleaned = series.astype(str).str.replace(",", "", regex=False).str.replace(" ", "", regex=False).str.strip()
-    return pd.to_numeric(cleaned, errors="coerce")
-
-
-def classify_row(row) -> str:
-    if row["_merge"] == "left_only":
-        return "MISSING_IN_MIXX"
-    if row["_merge"] == "right_only":
-        return "MISSING_IN_QOS"
-
-    q_amt, m_amt = row["qos_amount"], row["mixx_amount"]
-    if pd.notna(q_amt) and pd.notna(m_amt) and abs(q_amt - m_amt) > AMOUNT_TOLERANCE:
-        return "AMOUNT_MISMATCH"
-
-    q_status, m_status = row["qos_status"], row["mixx_status"]
-    if pd.notna(q_status) and pd.notna(m_status):
-        if (str(q_status).lower() in SUCCESS_STATUSES) != (str(m_status).lower() in SUCCESS_STATUSES):
-            return "STATUS_MISMATCH"
-
-    return "MATCHED"
-
-
-@app.post("/api/reconcile/mixx")
-async def reconcile_qos_vs_mixx(
-    mixx_file: UploadFile = File(...),
-    date_from: str | None = None,
-    date_to: str | None = None,
-):
-    """
-    Compares the live QoS transactions in MySQL (transactions_tg) against an uploaded Mixx file.
-    Optional date_from / date_to (e.g. 2026-10-01) limit which QoS rows are compared,
-    so a one-day Mixx file isn't compared against months of QoS data.
-    """
-    try:
-        # ---- Mixx file -------------------------------------------------
-        raw = await mixx_file.read()
-        filename = (mixx_file.filename or "").lower()
-        if filename.endswith((".xlsx", ".xls")):
-            mixx_df = pd.read_excel(io.BytesIO(raw))
-        else:
-            mixx_df = pd.read_csv(io.BytesIO(raw))
-        mixx_df = clean_dataframe(mixx_df)
-
-        id_col = pick_column(mixx_df, MIXX_ID_CANDIDATES)
-        if not id_col:
-            raise HTTPException(
-                status_code=400,
-                detail=f"No transaction ID column found in Mixx file. Columns found: {list(mixx_df.columns)}. "
-                       f"Add the right name to MIXX_ID_CANDIDATES in main.py.",
-            )
-        amount_col = pick_column(mixx_df, MIXX_AMOUNT_CANDIDATES)
-        status_col = pick_column(mixx_df, MIXX_STATUS_CANDIDATES)
-
-        mixx_df = mixx_df[mixx_df[id_col].notna()].copy()
-        mixx = pd.DataFrame({"match_key": mixx_df[id_col].astype(str).str.strip()})
-        mixx["mixx_amount"] = to_number(mixx_df[amount_col]) if amount_col else float("nan")
-        mixx["mixx_status"] = mixx_df[status_col].astype(str).str.strip().str.lower() if status_col else None
-        mixx = mixx[mixx["match_key"] != ""]
-
-        mixx_duplicate_ids = mixx[mixx.duplicated("match_key", keep=False)]["match_key"].unique().tolist()
-        mixx = mixx.drop_duplicates("match_key", keep="first")
-
-        # ---- QoS data from MySQL ----------------------------------------
-        sql = (
-            f"SELECT transactionid, {QOS_KEY_COLUMN} AS match_key, {QOS_AMOUNT_COLUMN} AS qos_amount, "
-            f"status AS qos_status, trxndate FROM transactions_tg"
-        )
-        clauses, params = [], []
-        if date_from:
-            clauses.append("trxndate >= %s")
-            params.append(date_from)
-        if date_to:
-            clauses.append("trxndate <= %s")
-            params.append(date_to)
-        if clauses:
-            sql += " WHERE " + " AND ".join(clauses)
-
-        connection = get_db_connection()
-        try:
-            with connection.cursor() as cursor:
-                cursor.execute(sql, params)
-                qos_rows = cursor.fetchall()
-        finally:
-            connection.close()
-
-        qos = pd.DataFrame(qos_rows, columns=["transactionid", "match_key", "qos_amount", "qos_status", "trxndate"])
-        qos_total_rows = len(qos)
-        qos = qos[qos["match_key"].notna()].copy()
-        qos["match_key"] = qos["match_key"].astype(str).str.strip()
-        qos = qos[qos["match_key"] != ""]
-        qos_without_key = qos_total_rows - len(qos)
-
-        qos_duplicate_ids = qos[qos.duplicated("match_key", keep=False)]["match_key"].unique().tolist()
-        qos = qos.drop_duplicates("match_key", keep="first")
-        qos["qos_amount"] = to_number(qos["qos_amount"])
-        qos["qos_status"] = qos["qos_status"].astype(str).str.strip().str.lower()
-
-        # ---- Compare -----------------------------------------------------
-        merged = qos.merge(mixx, on="match_key", how="outer", indicator=True)
-        merged["result"] = merged.apply(classify_row, axis=1)
-
-        counts = merged["result"].value_counts().to_dict()
-        total = len(merged)
-        matched = int(counts.get("MATCHED", 0))
-
-        exceptions = merged[merged["result"] != "MATCHED"].copy()
-        exceptions["trxndate"] = exceptions["trxndate"].astype(str).replace({"NaT": None, "nan": None, "None": None})
-        exceptions = exceptions[
-            ["match_key", "transactionid", "trxndate", "qos_amount", "mixx_amount", "qos_status", "mixx_status", "result"]
-        ]
-        exceptions = exceptions.astype(object).where(pd.notna(exceptions), None)
-
-        return {
-            "summary": {
-                "audit_health": round(matched / total * 100, 2) if total else 0.0,
-                "total_compared": total,
-                "matched": matched,
-                "missing_in_mixx": int(counts.get("MISSING_IN_MIXX", 0)),
-                "missing_in_qos": int(counts.get("MISSING_IN_QOS", 0)),
-                "amount_mismatch": int(counts.get("AMOUNT_MISMATCH", 0)),
-                "status_mismatch": int(counts.get("STATUS_MISMATCH", 0)),
-            },
-            "warnings": {
-                "qos_rows_without_match_key": qos_without_key,
-                "duplicate_ids_in_mixx_file": mixx_duplicate_ids[:50],
-                "duplicate_ids_in_qos": qos_duplicate_ids[:50],
-                "mixx_columns_used": {"id": id_col, "amount": amount_col, "status": status_col},
-            },
-            "exceptions": exceptions.head(500).to_dict(orient="records"),
-        }
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.exception("QoS vs Mixx reconciliation failed")
-        raise HTTPException(status_code=400, detail=f"Reconciliation failed: {str(e)}")
-
-
-# ---------------------------------------------------------------------------
-# QOS transactions for the web page (streamed, so the server never holds
-# all rows in memory at once -- the free Render server only has 512 MB)
-# ---------------------------------------------------------------------------
-def _json_default(value):
+def json_default(value):
     if isinstance(value, (datetime, date)):
         return value.isoformat()
     if isinstance(value, Decimal):
@@ -389,14 +137,110 @@ def _json_default(value):
     return str(value)
 
 
-@app.get("/api/qos/transactions")
-def get_qos_transactions(date_from: str, date_to: str):
-    """
-    Returns the QOS transactions between two datetimes (e.g. 2026-09-10 00:00:00),
-    streamed as a JSON list. Column names are renamed to match the QOS workbook
-    columns that src/reconcile.js expects (momtransactionId, transRef, operationType, netAmount).
-    ASSUMPTION: clientrefno in the table is the same value as "transRef" in the QOS workbook.
-    """
+@app.get("/")
+def health():
+    return {"ok": True, "service": "QOS Recon API"}
+
+
+@app.post("/api/login")
+def login(payload: LoginPayload):
+    if not TEAM_PASSWORD:
+        raise HTTPException(status_code=500, detail="TEAM_PASSWORD is not configured")
+
+    if not secrets.compare_digest(payload.password, TEAM_PASSWORD):
+        raise HTTPException(status_code=401, detail="Wrong password")
+
+    return {
+        "token": _make_token(payload.password),
+        "expires_in": TOKEN_HOURS * 3600,
+    }
+
+
+def tidy(value):
+    if value is None:
+        return ""
+    try:
+        if pd.isna(value):
+            return ""
+    except (TypeError, ValueError):
+        pass
+    return str(value).strip()
+
+
+def upper(value):
+    return tidy(value).upper()
+
+
+def number(value):
+    if value is None or value == "":
+        return None
+    try:
+        result = float(str(value).replace(",", "").strip())
+        return result if pd.notna(result) else None
+    except (TypeError, ValueError):
+        return None
+
+
+def date_key(value):
+    if value is None or value == "":
+        return ""
+
+    if isinstance(value, (datetime, date)):
+        return value.strftime("%Y-%m-%d")
+
+    text = str(value).strip()
+    if len(text) >= 10 and text[4:5] == "-" and text[7:8] == "-":
+        return text[:10]
+
+    parsed = pd.to_datetime(value, errors="coerce")
+    return "" if pd.isna(parsed) else parsed.strftime("%Y-%m-%d")
+
+
+def parse_bound(value, is_end=False):
+    try:
+        if len(value) == 10:
+            parsed = datetime.strptime(value, "%Y-%m-%d")
+            if is_end:
+                parsed = parsed.replace(hour=23, minute=59, second=59)
+            return parsed
+
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).replace(tzinfo=None)
+    except ValueError:
+        raise HTTPException(status_code=400, detail=f"Invalid date: {value}")
+
+
+def read_operator_file(contents, filename):
+    if not contents:
+        raise HTTPException(status_code=400, detail="The Mixx file is empty")
+
+    try:
+        if filename.lower().endswith(".csv"):
+            df = pd.read_csv(io.BytesIO(contents))
+        else:
+            df = pd.read_excel(io.BytesIO(contents))
+    except Exception as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Could not read the Mixx workbook: {exc}",
+        )
+
+    df.columns = [str(column).strip() for column in df.columns]
+    return df.where(pd.notna(df), None).to_dict(orient="records")
+
+
+def fetch_qos_rows(date_from, date_to):
+    if not date_from or not date_to:
+        raise HTTPException(
+            status_code=400,
+            detail="Both start and end dates are required",
+        )
+
+    start = parse_bound(date_from)
+    end = parse_bound(date_to, is_end=True)
+
+    if start > end:
+        raise HTTPException(status_code=400, detail="Start date is after end date")
+
     sql = """
         SELECT
             momtransaction_id AS momtransactionId,
@@ -413,29 +257,444 @@ def get_qos_transactions(date_from: str, date_to: str):
         WHERE trxndate >= %s AND trxndate <= %s
         ORDER BY trxndate
     """
+
+    rows = []
     connection = None
+    cursor = None
+
     try:
         connection = get_db_connection()
-        cursor = connection.cursor(pymysql.cursors.SSDictCursor)  # streams rows, does not load them all
-        cursor.execute(sql, (date_from, date_to))
+        cursor = connection.cursor(pymysql.cursors.SSDictCursor)
+        cursor.execute(sql, (start, end))
+
+        while True:
+            batch = cursor.fetchmany(5000)
+            if not batch:
+                break
+            rows.extend(batch)
     except Exception:
+        logger.exception("Failed to fetch QOS transactions")
+        raise HTTPException(status_code=500, detail="Could not load QOS transactions")
+    finally:
+        if cursor:
+            cursor.close()
         if connection:
             connection.close()
-        logger.exception("Could not load QOS transactions")
-        raise HTTPException(status_code=500, detail="Could not load QOS transactions from the database")
+
+    return rows
+
+
+def composite_from_qos(row):
+    client = tidy(row.get("clientid"))
+    ref = tidy(row.get("transRef"))
+    return f"{client}!{ref}" if client and ref else ""
+
+
+def expected_amount(qos):
+    if upper(qos.get("operationType")) == "MAKEDEPOSIT":
+        value = qos.get("netAmount")
+        return number(value if value is not None else qos.get("amount"))
+    return number(qos.get("amount"))
+
+
+def qos_successful(qos):
+    return (
+        upper(qos.get("responsemessage")) == "SUCCESSFULL"
+        or number(qos.get("response")) == 0
+    )
+
+
+def reconcile_records(qos_rows, operator_rows):
+    # Preserve the frontend rule: the last duplicate key wins.
+    by_trans_id = {}
+    by_request = {}
+
+    for index, op in enumerate(operator_rows):
+        tx = tidy(op.get("trans_id"))
+        request = tidy(op.get("idRequete"))
+
+        if tx:
+            by_trans_id[tx] = {"row": op, "index": index}
+        if request:
+            by_request[request] = {"row": op, "index": index}
+
+    used_operator = set()
+    rows = []
+    matched = mismatched = unmatched = 0
+    discrepancy_value = 0.0
+    trend_map = {}
+
+    def add_trend(value, status):
+        key = date_key(value)
+        if not key:
+            return
+
+        if key not in trend_map:
+            trend_map[key] = {
+                "date": key,
+                "matched": 0,
+                "exceptions": 0,
+            }
+
+        if status == "Matched":
+            trend_map[key]["matched"] += 1
+        else:
+            trend_map[key]["exceptions"] += 1
+
+    for index, qos in enumerate(qos_rows):
+        tx = tidy(qos.get("momtransactionId"))
+        request = composite_from_qos(qos)
+
+        found = (by_trans_id.get(tx) if tx else None) or (
+            by_request.get(request) if request else None
+        )
+
+        op = found["row"] if found else None
+        if found:
+            used_operator.add(found["index"])
+
+        expected = expected_amount(qos)
+        actual = number(op.get("Amount")) if op else None
+
+        amount_matches = (
+            expected is None
+            or actual is None
+            or abs(expected - actual) < 0.01
+        )
+        tx_matches = bool(tx and op and tx == tidy(op.get("trans_id")))
+        request_matches = bool(
+            request and op and request == tidy(op.get("idRequete"))
+        )
+
+        if not op:
+            status = "Unmatched"
+        elif amount_matches and (tx_matches or request_matches):
+            status = "Matched"
+        else:
+            status = "Mismatched"
+
+        delta = (
+            actual - expected
+            if op and actual is not None and expected is not None
+            else None
+        )
+
+        if status == "Matched":
+            matched += 1
+        elif status == "Mismatched":
+            mismatched += 1
+        else:
+            unmatched += 1
+
+        if delta is not None:
+            discrepancy_value += delta
+
+        rows.append({
+            "rowKey": f"qos-{index}",
+            "source": "QOS",
+            "id": tx or request or tidy(qos.get("transRef")) or f"QOS-{index + 1}",
+            "qosTransactionId": tx,
+            "operatorTransactionId": tidy(op.get("trans_id")) if op else "",
+            "requestId": request,
+            "operatorRequestId": tidy(op.get("idRequete")) if op else "",
+            "time": qos.get("trxndate"),
+            "amount": expected,
+            "operatorAmount": actual,
+            "delta": delta,
+            "currency": tidy(qos.get("currency")) or "XOF",
+            "status": status,
+            "operationType": tidy(qos.get("operationType")),
+            "qosResult": tidy(qos.get("responsemessage")),
+            "operatorState": tidy(op.get("trans_state")) if op else "Missing",
+            "qosSuccessful": qos_successful(qos),
+        })
+
+        add_trend(qos.get("trxndate"), status)
+
+    for index, op in enumerate(operator_rows):
+        if index in used_operator:
+            continue
+
+        unmatched += 1
+        tx = tidy(op.get("trans_id"))
+        request = tidy(op.get("idRequete"))
+
+        rows.append({
+            "rowKey": f"operator-{index}",
+            "source": "Operator",
+            "id": tx or request or f"OP-{index + 1}",
+            "qosTransactionId": "",
+            "operatorTransactionId": tx,
+            "requestId": "",
+            "operatorRequestId": request,
+            "time": op.get("trans_date"),
+            "amount": None,
+            "operatorAmount": number(op.get("Amount")),
+            "delta": None,
+            "currency": "XOF",
+            "status": "Unmatched",
+            "operationType": tidy(op.get("trans_type")),
+            "qosResult": "Missing",
+            "operatorState": tidy(op.get("trans_state")),
+            "qosSuccessful": False,
+        })
+
+        add_trend(op.get("trans_date"), "Unmatched")
+
+    total = len(rows)
+    discrepancies = mismatched + unmatched
+
+    return {
+        "rows": rows,
+        "metrics": {
+            "total": total,
+            "matched": matched,
+            "mismatched": mismatched,
+            "unmatched": unmatched,
+            "discrepancies": discrepancies,
+            "matchRate": matched / total * 100 if total else 0,
+            "discrepancyValue": discrepancy_value,
+        },
+        "trend": [trend_map[key] for key in sorted(trend_map)],
+        "sourceCounts": {
+            "qos": len(qos_rows),
+            "operator": len(operator_rows),
+        },
+    }
+
+
+@app.post("/webhook/qos")
+def qos_webhook(
+    payload: QoSTransactionPayload,
+    x_api_key: Optional[str] = Header(default=None),
+):
+    if API_KEY and not hmac.compare_digest(x_api_key or "", API_KEY):
+        raise HTTPException(status_code=401, detail="Invalid API key")
+
+    data = payload.model_dump(exclude_none=True) if hasattr(
+        payload, "model_dump"
+    ) else payload.dict(exclude_none=True)
+
+    if not data:
+        raise HTTPException(status_code=400, detail="Empty payload")
+
+    columns = list(data)
+    sql = (
+        "INSERT INTO transactions_tg ("
+        + ", ".join(f"`{column}`" for column in columns)
+        + ") VALUES ("
+        + ", ".join(["%s"] * len(columns))
+        + ")"
+    )
+
+    try:
+        with get_db_connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(sql, [data[column] for column in columns])
+        return {"ok": True}
+    except Exception:
+        logger.exception("Could not insert QOS webhook payload")
+        raise HTTPException(status_code=500, detail="Could not store QOS transaction")
+
+
+@app.post("/api/reconcile/run")
+async def reconcile_run(
+    file: UploadFile = File(...),
+    date_from: Optional[str] = Query(default=None),
+    date_to: Optional[str] = Query(default=None),
+    _logged_in: bool = Depends(require_login),
+):
+    started = time.perf_counter()
+    operator_rows = read_operator_file(await file.read(), file.filename or "")
+
+    if not operator_rows:
+        raise HTTPException(status_code=400, detail="The Mixx workbook has no data rows")
+
+    # If dates are omitted, infer them from Mixx transaction dates.
+    dates = sorted(
+        key for key in (date_key(row.get("trans_date")) for row in operator_rows)
+        if key
+    )
+
+    date_from = date_from or (dates[0] if dates else None)
+    date_to = date_to or (dates[-1] if dates else None)
+
+    if not date_from or not date_to:
+        raise HTTPException(
+            status_code=400,
+            detail="Choose a date range; Mixx trans_date dates could not be determined.",
+        )
+
+    # Filter Mixx rows to the selected date range, matching the frontend behaviour.
+    operator_rows = [
+        row for row in operator_rows
+        if date_from <= date_key(row.get("trans_date")) <= date_to
+    ]
+
+    if not operator_rows:
+        raise HTTPException(
+            status_code=400,
+            detail="No Mixx transactions were found in the selected date range.",
+        )
+
+    qos_rows = fetch_qos_rows(date_from, date_to)
+
+    if not qos_rows:
+        raise HTTPException(
+            status_code=404,
+            detail="No QOS transactions were found for the selected dates.",
+        )
+
+    result = reconcile_records(qos_rows, operator_rows)
+    result["serverSeconds"] = round(time.perf_counter() - started, 2)
+
+    logger.info(
+        "Reconciliation completed in %.2fs: QOS=%s operator=%s output=%s",
+        result["serverSeconds"],
+        len(qos_rows),
+        len(operator_rows),
+        len(result["rows"]),
+    )
+
+    return Response(
+    content=json.dumps(
+        result,
+        default=json_default,
+        separators=(",", ":"),
+    ),
+    media_type="application/json",
+)
+
+
+@app.post("/api/reconcile")
+async def reconcile_files(
+    file_a: UploadFile = File(...),
+    file_b: UploadFile = File(...),
+    _logged_in: bool = Depends(require_login),
+):
+    try:
+        def load_file(upload):
+            name = (upload.filename or "").lower()
+            return (
+                pd.read_csv(upload.file)
+                if name.endswith(".csv")
+                else pd.read_excel(upload.file)
+            )
+
+        a = load_file(file_a)
+        b = load_file(file_b)
+        a.columns = [str(c).strip() for c in a.columns]
+        b.columns = [str(c).strip() for c in b.columns]
+        common = [column for column in a.columns if column in b.columns]
+
+        if not common:
+            raise HTTPException(status_code=400, detail="Files have no columns in common")
+
+        merged = a.merge(
+            b, how="outer", on=common, indicator=True, suffixes=("_a", "_b")
+        )
+        records = json.loads(merged.to_json(orient="records", date_format="iso"))
+        return {"rows": records, "total": len(records), "common_columns": common}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Generic file reconciliation failed")
+        raise HTTPException(status_code=400, detail=f"Could not reconcile files: {exc}")
+
+
+@app.post("/api/reconcile/mixx")
+async def reconcile_mixx_legacy(
+    file: UploadFile = File(...),
+    date_from: Optional[str] = Query(default=None),
+    date_to: Optional[str] = Query(default=None),
+    _logged_in: bool = Depends(require_login),
+):
+    # Keep the old route available, but use the same rules as the new endpoint.
+    started = time.perf_counter()
+    operator_rows = read_operator_file(await file.read(), file.filename or "")
+
+    dates = sorted(
+        key for key in (date_key(row.get("trans_date")) for row in operator_rows)
+        if key
+    )
+    date_from = date_from or (dates[0] if dates else None)
+    date_to = date_to or (dates[-1] if dates else None)
+
+    qos_rows = fetch_qos_rows(date_from, date_to)
+    result = reconcile_records(qos_rows, operator_rows)
+    result["serverSeconds"] = round(time.perf_counter() - started, 2)
+    return Response(
+    content=json.dumps(
+        result,
+        default=json_default,
+        separators=(",", ":"),
+    ),
+    media_type="application/json",
+)
+
+
+@app.get("/api/qos/transactions")
+def get_qos_transactions(
+    date_from: str,
+    date_to: str,
+    _logged_in: bool = Depends(require_login),
+):
+    start = parse_bound(date_from)
+    end = parse_bound(date_to, is_end=True)
+
+    if start > end:
+        raise HTTPException(status_code=400, detail="Start date is after end date")
+
+    sql = """
+        SELECT momtransaction_id AS momtransactionId,
+               clientid,
+               clientrefno AS transRef,
+               operation_type AS operationType,
+               amount,
+               net_amount AS netAmount,
+               trxndate,
+               currency,
+               response,
+               responsemessage
+        FROM transactions_tg
+        WHERE trxndate >= %s AND trxndate <= %s
+        ORDER BY trxndate
+    """
 
     def stream():
+        connection = None
+        cursor = None
+
         try:
+            connection = get_db_connection()
+            cursor = connection.cursor(pymysql.cursors.SSDictCursor)
+            cursor.execute(sql, (start, end))
             yield "["
             first = True
-            for row in cursor:
-                if not first:
-                    yield ","
-                first = False
-                yield json.dumps(row, default=_json_default)
+
+            while True:
+                batch = cursor.fetchmany(1000)
+                if not batch:
+                    break
+
+                encoded = []
+                for row in batch:
+                    if not first:
+                        encoded.append(",")
+                    first = False
+                    encoded.append(
+                        json.dumps(row, default=json_default, separators=(",", ":"))
+                    )
+                yield "".join(encoded)
+
             yield "]"
+        except Exception:
+            logger.exception("Could not stream QOS transactions")
+            raise
         finally:
-            cursor.close()
-            connection.close()
+            if cursor:
+                cursor.close()
+            if connection:
+                connection.close()
 
     return StreamingResponse(stream(), media_type="application/json")
